@@ -5372,6 +5372,17 @@ mod tests {
                 args: Some("help".to_string())
             }
         );
+        assert_eq!(
+            parse_args(&[
+                "/skills".to_string(),
+                "install".to_string(),
+                "./fixtures/help-skill".to_string(),
+            ])
+            .expect("/skills install should parse"),
+            CliAction::Skills {
+                args: Some("install ./fixtures/help-skill".to_string())
+            }
+        );
         let error = parse_args(&["/status".to_string()])
             .expect_err("/status should remain REPL-only when invoked directly");
         assert!(error.contains("interactive-only"));

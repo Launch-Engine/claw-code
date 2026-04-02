@@ -227,8 +227,8 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "skills",
         aliases: &[],
-        summary: "List available skills",
-        argument_hint: Some("[list|help]"),
+        summary: "List or install available skills",
+        argument_hint: Some("[list|install <path>|help]"),
         resume_supported: true,
     },
 ];
@@ -416,7 +416,7 @@ pub fn validate_slash_command_input(
             args: parse_list_or_help_args(command, remainder)?,
         },
         "skills" => SlashCommand::Skills {
-            args: parse_list_or_help_args(command, remainder)?,
+            args: parse_skills_args(remainder.as_deref())?,
         },
         other => SlashCommand::Unknown(other.to_string()),
     }))
@@ -631,6 +631,38 @@ fn parse_list_or_help_args(
             &format!("/{command} [list|help]"),
         )),
     }
+}
+
+fn parse_skills_args(args: Option<&str>) -> Result<Option<String>, SlashCommandParseError> {
+    let Some(args) = normalize_optional_args(args) else {
+        return Ok(None);
+    };
+
+    if matches!(args, "list" | "help" | "-h" | "--help") {
+        return Ok(Some(args.to_string()));
+    }
+
+    if args == "install" {
+        return Err(command_error(
+            "Usage: /skills install <path>",
+            "skills",
+            "/skills install <path>",
+        ));
+    }
+
+    if let Some(target) = args.strip_prefix("install").map(str::trim) {
+        if !target.is_empty() {
+            return Ok(Some(format!("install {target}")));
+        }
+    }
+
+    Err(command_error(
+        &format!(
+            "Unexpected arguments for /skills: {args}. Use /skills, /skills list, /skills install <path>, or /skills help."
+        ),
+        "skills",
+        "/skills [list|install <path>|help]",
+    ))
 }
 
 fn usage_error(command: &str, argument_hint: &str) -> SlashCommandParseError {
@@ -942,6 +974,21 @@ struct SkillRoot {
     origin: SkillOrigin,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InstalledSkill {
+    invocation_name: String,
+    display_name: Option<String>,
+    source: PathBuf,
+    registry_root: PathBuf,
+    installed_path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SkillInstallSource {
+    Directory { root: PathBuf, prompt_path: PathBuf },
+    MarkdownFile { path: PathBuf },
+}
+
 #[allow(clippy::too_many_lines)]
 pub fn handle_plugins_slash_command(
     action: Option<&str>,
@@ -1072,6 +1119,15 @@ pub fn handle_skills_slash_command(args: Option<&str>, cwd: &Path) -> std::io::R
             let roots = discover_skill_roots(cwd);
             let skills = load_skills_from_roots(&roots)?;
             Ok(render_skills_report(&skills))
+        }
+        Some("install") => Ok(render_skills_usage(Some("install"))),
+        Some(args) if args.starts_with("install ") => {
+            let target = args["install ".len()..].trim();
+            if target.is_empty() {
+                return Ok(render_skills_usage(Some("install")));
+            }
+            let install = install_skill(target, cwd)?;
+            Ok(render_skill_install_report(&install))
         }
         Some("-h" | "--help" | "help") => Ok(render_skills_usage(None)),
         Some(args) => Ok(render_skills_usage(Some(args))),
@@ -1246,6 +1302,202 @@ fn discover_skill_roots(cwd: &Path) -> Vec<SkillRoot> {
     }
 
     roots
+}
+
+fn install_skill(source: &str, cwd: &Path) -> std::io::Result<InstalledSkill> {
+    let registry_root = default_skill_install_root()?;
+    install_skill_into(source, cwd, &registry_root)
+}
+
+fn install_skill_into(
+    source: &str,
+    cwd: &Path,
+    registry_root: &Path,
+) -> std::io::Result<InstalledSkill> {
+    let source = resolve_skill_install_source(source, cwd)?;
+    let prompt_path = source.prompt_path();
+    let contents = fs::read_to_string(prompt_path)?;
+    let display_name = parse_skill_frontmatter(&contents).0;
+    let invocation_name = derive_skill_install_name(&source, display_name.as_deref())?;
+    let installed_path = registry_root.join(&invocation_name);
+
+    if installed_path.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!(
+                "skill '{invocation_name}' is already installed at {}",
+                installed_path.display()
+            ),
+        ));
+    }
+
+    fs::create_dir_all(&installed_path)?;
+    let install_result = match &source {
+        SkillInstallSource::Directory { root, .. } => {
+            copy_directory_contents(root, &installed_path)
+        }
+        SkillInstallSource::MarkdownFile { path } => {
+            fs::copy(path, installed_path.join("SKILL.md")).map(|_| ())
+        }
+    };
+    if let Err(error) = install_result {
+        let _ = fs::remove_dir_all(&installed_path);
+        return Err(error);
+    }
+
+    Ok(InstalledSkill {
+        invocation_name,
+        display_name,
+        source: source.report_path().to_path_buf(),
+        registry_root: registry_root.to_path_buf(),
+        installed_path,
+    })
+}
+
+fn default_skill_install_root() -> std::io::Result<PathBuf> {
+    if let Ok(codex_home) = env::var("CODEX_HOME") {
+        return Ok(PathBuf::from(codex_home).join("skills"));
+    }
+    if let Some(home) = env::var_os("HOME") {
+        return Ok(PathBuf::from(home).join(".codex").join("skills"));
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "unable to resolve a skills install root; set CODEX_HOME or HOME",
+    ))
+}
+
+fn resolve_skill_install_source(source: &str, cwd: &Path) -> std::io::Result<SkillInstallSource> {
+    let candidate = PathBuf::from(source);
+    let source = if candidate.is_absolute() {
+        candidate
+    } else {
+        cwd.join(candidate)
+    };
+    let source = fs::canonicalize(&source)?;
+
+    if source.is_dir() {
+        let prompt_path = source.join("SKILL.md");
+        if !prompt_path.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "skill directory '{}' must contain SKILL.md",
+                    source.display()
+                ),
+            ));
+        }
+        return Ok(SkillInstallSource::Directory {
+            root: source,
+            prompt_path,
+        });
+    }
+
+    if source
+        .extension()
+        .is_some_and(|ext| ext.to_string_lossy().eq_ignore_ascii_case("md"))
+    {
+        return Ok(SkillInstallSource::MarkdownFile { path: source });
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!(
+            "skill source '{}' must be a directory with SKILL.md or a markdown file",
+            source.display()
+        ),
+    ))
+}
+
+fn derive_skill_install_name(
+    source: &SkillInstallSource,
+    declared_name: Option<&str>,
+) -> std::io::Result<String> {
+    for candidate in [declared_name, source.fallback_name().as_deref()] {
+        if let Some(candidate) = candidate.and_then(sanitize_skill_invocation_name) {
+            return Ok(candidate);
+        }
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!(
+            "unable to derive an installable invocation name from '{}'",
+            source.report_path().display()
+        ),
+    ))
+}
+
+fn sanitize_skill_invocation_name(candidate: &str) -> Option<String> {
+    let trimmed = candidate
+        .trim()
+        .trim_start_matches('/')
+        .trim_start_matches('$');
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let mut sanitized = String::new();
+    let mut last_was_separator = false;
+    for ch in trimmed.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+            sanitized.push(ch.to_ascii_lowercase());
+            last_was_separator = false;
+        } else if (ch.is_whitespace() || matches!(ch, '/' | '\\'))
+            && !last_was_separator
+            && !sanitized.is_empty()
+        {
+            sanitized.push('-');
+            last_was_separator = true;
+        }
+    }
+
+    let sanitized = sanitized
+        .trim_matches(|ch| matches!(ch, '-' | '_' | '.'))
+        .to_string();
+    (!sanitized.is_empty()).then_some(sanitized)
+}
+
+fn copy_directory_contents(source: &Path, destination: &Path) -> std::io::Result<()> {
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let entry_type = entry.file_type()?;
+        let destination_path = destination.join(entry.file_name());
+        if entry_type.is_dir() {
+            fs::create_dir_all(&destination_path)?;
+            copy_directory_contents(&entry.path(), &destination_path)?;
+        } else {
+            fs::copy(entry.path(), destination_path)?;
+        }
+    }
+    Ok(())
+}
+
+impl SkillInstallSource {
+    fn prompt_path(&self) -> &Path {
+        match self {
+            Self::Directory { prompt_path, .. } => prompt_path,
+            Self::MarkdownFile { path } => path,
+        }
+    }
+
+    fn fallback_name(&self) -> Option<String> {
+        match self {
+            Self::Directory { root, .. } => root
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string()),
+            Self::MarkdownFile { path } => path
+                .file_stem()
+                .map(|name| name.to_string_lossy().to_string()),
+        }
+    }
+
+    fn report_path(&self) -> &Path {
+        match self {
+            Self::Directory { root, .. } => root,
+            Self::MarkdownFile { path } => path,
+        }
+    }
 }
 
 fn push_unique_root(
@@ -1571,6 +1823,27 @@ fn render_skills_report(skills: &[SkillSummary]) -> String {
     lines.join("\n").trim_end().to_string()
 }
 
+fn render_skill_install_report(skill: &InstalledSkill) -> String {
+    let mut lines = vec![
+        "Skills".to_string(),
+        format!("  Result           installed {}", skill.invocation_name),
+        format!("  Invoke as        ${}", skill.invocation_name),
+    ];
+    if let Some(display_name) = &skill.display_name {
+        lines.push(format!("  Display name     {display_name}"));
+    }
+    lines.push(format!("  Source           {}", skill.source.display()));
+    lines.push(format!(
+        "  Registry         {}",
+        skill.registry_root.display()
+    ));
+    lines.push(format!(
+        "  Installed path   {}",
+        skill.installed_path.display()
+    ));
+    lines.join("\n")
+}
+
 fn normalize_optional_args(args: Option<&str>) -> Option<&str> {
     args.map(str::trim).filter(|value| !value.is_empty())
 }
@@ -1591,8 +1864,9 @@ fn render_agents_usage(unexpected: Option<&str>) -> String {
 fn render_skills_usage(unexpected: Option<&str>) -> String {
     let mut lines = vec![
         "Skills".to_string(),
-        "  Usage            /skills [list|help]".to_string(),
-        "  Direct CLI       claw skills".to_string(),
+        "  Usage            /skills [list|install <path>|help]".to_string(),
+        "  Direct CLI       claw skills [list|install <path>|help]".to_string(),
+        "  Install root     $CODEX_HOME/skills or ~/.codex/skills".to_string(),
         "  Sources          .codex/skills, .claude/skills, legacy /commands".to_string(),
     ];
     if let Some(args) = unexpected {
@@ -1922,6 +2196,12 @@ mod tests {
             }))
         );
         assert_eq!(
+            SlashCommand::parse("/skills install ./fixtures/help-skill"),
+            Ok(Some(SlashCommand::Skills {
+                args: Some("install ./fixtures/help-skill".to_string())
+            }))
+        );
+        assert_eq!(
             SlashCommand::parse("/plugins disable demo"),
             Ok(Some(SlashCommand::Plugins {
                 action: Some("disable".to_string()),
@@ -2014,9 +2294,9 @@ mod tests {
         ));
         assert!(agents_error.contains("  Usage            /agents [list|help]"));
         assert!(skills_error.contains(
-            "Unexpected arguments for /skills: show help. Use /skills, /skills list, or /skills help."
+            "Unexpected arguments for /skills: show help. Use /skills, /skills list, /skills install <path>, or /skills help."
         ));
-        assert!(skills_error.contains("  Usage            /skills [list|help]"));
+        assert!(skills_error.contains("  Usage            /skills [list|install <path>|help]"));
     }
 
     #[test]
@@ -2057,7 +2337,7 @@ mod tests {
         ));
         assert!(help.contains("aliases: /plugins, /marketplace"));
         assert!(help.contains("/agents [list|help]"));
-        assert!(help.contains("/skills [list|help]"));
+        assert!(help.contains("/skills [list|install <path>|help]"));
         assert_eq!(slash_command_specs().len(), 26);
         assert_eq!(resume_supported_slash_commands().len(), 14);
     }
@@ -2374,7 +2654,8 @@ mod tests {
 
         let skills_help =
             super::handle_skills_slash_command(Some("--help"), &cwd).expect("skills help");
-        assert!(skills_help.contains("Usage            /skills [list|help]"));
+        assert!(skills_help.contains("Usage            /skills [list|install <path>|help]"));
+        assert!(skills_help.contains("Install root     $CODEX_HOME/skills or ~/.codex/skills"));
         assert!(skills_help.contains("legacy /commands"));
 
         let skills_unexpected =
@@ -2390,6 +2671,57 @@ mod tests {
         let (name, description) = super::parse_skill_frontmatter(contents);
         assert_eq!(name.as_deref(), Some("hud"));
         assert_eq!(description.as_deref(), Some("Quoted description"));
+    }
+
+    #[test]
+    fn installs_skill_into_user_registry_and_preserves_nested_files() {
+        let workspace = temp_dir("skills-install-workspace");
+        let source_root = workspace.join("source").join("help");
+        let install_root = temp_dir("skills-install-root");
+        write_skill(
+            source_root.parent().expect("parent"),
+            "help",
+            "Helpful skill",
+        );
+        let script_dir = source_root.join("scripts");
+        fs::create_dir_all(&script_dir).expect("script dir");
+        fs::write(script_dir.join("run.sh"), "#!/bin/sh\necho help\n").expect("write script");
+
+        let installed = super::install_skill_into(
+            source_root.to_str().expect("utf8 skill path"),
+            &workspace,
+            &install_root,
+        )
+        .expect("skill should install");
+
+        assert_eq!(installed.invocation_name, "help");
+        assert_eq!(installed.display_name.as_deref(), Some("help"));
+        assert!(installed.installed_path.ends_with(Path::new("help")));
+        assert!(installed.installed_path.join("SKILL.md").is_file());
+        assert!(installed
+            .installed_path
+            .join("scripts")
+            .join("run.sh")
+            .is_file());
+
+        let report = super::render_skill_install_report(&installed);
+        assert!(report.contains("Result           installed help"));
+        assert!(report.contains("Invoke as        $help"));
+        assert!(report.contains(&install_root.display().to_string()));
+
+        let roots = vec![SkillRoot {
+            source: DefinitionSource::UserCodexHome,
+            path: install_root.clone(),
+            origin: SkillOrigin::SkillsDir,
+        }];
+        let listed = render_skills_report(
+            &load_skills_from_roots(&roots).expect("installed skills should load"),
+        );
+        assert!(listed.contains("User ($CODEX_HOME):"));
+        assert!(listed.contains("help · Helpful skill"));
+
+        let _ = fs::remove_dir_all(workspace);
+        let _ = fs::remove_dir_all(install_root);
     }
 
     #[test]
